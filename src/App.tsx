@@ -3,15 +3,19 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import {
   SINGAPORE_BUS_STOPS,
   ROUTE_SEQUENCES,
   SERVICE_ALERTS,
   BusStop,
   BusServiceArrival,
+  BusArrivalTiming,
+  LoadStatus,
+  DeckType,
+  OperatorType,
 } from './data/singaporeTransitData';
-import { BusArrivalCard, LOAD_CONFIG } from './components/BusArrivalCard';
+import { BusArrivalCard } from './components/BusArrivalCard';
 import { RouteSequencePanel } from './components/RouteSequencePanel';
 import { InteractiveTransitMap } from './components/InteractiveTransitMap';
 import {
@@ -22,11 +26,9 @@ import {
   AlertTriangle,
   Bus,
   Navigation,
-  Clock,
   CheckCircle2,
   X,
   ArrowUpRight,
-  SlidersHorizontal,
 } from 'lucide-react';
 
 type ActiveTab = 'live' | 'routes' | 'saved' | 'advisories';
@@ -37,76 +39,264 @@ interface BookmarkedPair {
   serviceNo: string;
 }
 
+interface LtaNextBusRaw {
+  OriginCode?: string;
+  DestinationCode?: string;
+  EstimatedArrival?: string;
+  Monitored?: number;
+  Latitude?: string;
+  Longitude?: string;
+  VisitNumber?: string;
+  Load?: string;
+  Feature?: string;
+  Type?: string;
+}
+
+interface LtaServiceRaw {
+  ServiceNo: string;
+  Operator: string;
+  NextBus?: LtaNextBusRaw;
+  NextBus2?: LtaNextBusRaw;
+  NextBus3?: LtaNextBusRaw;
+}
+
+function parseLtaBusTiming(raw?: LtaNextBusRaw): BusArrivalTiming {
+  if (!raw || !raw.EstimatedArrival) {
+    return {
+      etaMinutes: 12,
+      load: 'SEA',
+      deck: 'SD',
+      isWAB: true,
+      lat: 1.2989,
+      lng: 103.8502,
+      visitNumber: 1,
+      monitored: false,
+    };
+  }
+
+  const arrivalTime = new Date(raw.EstimatedArrival).getTime();
+  const diffMs = arrivalTime - Date.now();
+  const etaMinutes = Math.max(0, Math.floor(diffMs / 60000));
+
+  const load: LoadStatus =
+    raw.Load === 'SEA' || raw.Load === 'SDA' || raw.Load === 'LSD'
+      ? raw.Load
+      : 'SEA';
+
+  const deck: DeckType =
+    raw.Type === 'DD' || raw.Type === 'BD' || raw.Type === 'SD'
+      ? raw.Type
+      : 'SD';
+
+  return {
+    etaMinutes: Number.isNaN(etaMinutes) ? 0 : etaMinutes,
+    load,
+    deck,
+    isWAB: raw.Feature === 'WAB',
+    lat: parseFloat(raw.Latitude || '1.2989') || 1.2989,
+    lng: parseFloat(raw.Longitude || '103.8502') || 103.8502,
+    visitNumber: raw.VisitNumber === '2' ? 2 : 1,
+    monitored: raw.Monitored === 1,
+  };
+}
+
 export default function App() {
-  // Core state
+  // Core state — default to 04121 per user's LTA BusArrival specification
   const [stopsData, setStopsData] = useState<BusStop[]>(SINGAPORE_BUS_STOPS);
-  const [selectedStopCode, setSelectedStopCode] = useState<string>('01012');
+  const [selectedStopCode, setSelectedStopCode] = useState<string>('04121');
   const [selectedServiceNo, setSelectedServiceNo] = useState<string>('147');
+  const [singleServiceQuery, setSingleServiceQuery] = useState<string>('');
   const [routeDirection, setRouteDirection] = useState<1 | 2>(1);
   const [activeTab, setActiveTab] = useState<ActiveTab>('live');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [categoryFilter, setCategoryFilter] = useState<CategoryFilter>('ALL');
 
-  // Bookmarks state (pre-populated with key Singapore commuter stops)
+  // Bookmarks state
   const [bookmarks, setBookmarks] = useState<BookmarkedPair[]>([
-    { stopCode: '01012', serviceNo: '147' },
+    { stopCode: '04121', serviceNo: '7' },
+    { stopCode: '04121', serviceNo: '147' },
     { stopCode: '01012', serviceNo: '190' },
     { stopCode: '09047', serviceNo: '190' },
-    { stopCode: '03218', serviceNo: '97e' },
   ]);
 
-  // 30-second LTA DataMall polling countdown state
-  const [pollCountdown, setPollCountdown] = useState<number>(30);
+  // 20-second LTA DataMall polling countdown state (Refreshes every 20 seconds per spec)
+  const REFRESH_INTERVAL_SECONDS = 20;
+  const [pollCountdown, setPollCountdown] = useState<number>(
+    REFRESH_INTERVAL_SECONDS
+  );
   const [isRefreshing, setIsRefreshing] = useState<boolean>(false);
   const [gpsStatus, setGpsStatus] = useState<string | null>(null);
+  const [apiLiveConnected, setApiLiveConnected] = useState<boolean>(false);
 
-  // Countdown timer & live ETA simulation
+  // Fetch live data from /api/bus-arrival?BusStopCode=...(&ServiceNo=...)
+  const fetchLtaBusArrivals = useCallback(
+    async (stopCode: string, serviceFilter?: string, manual = false) => {
+      if (manual) {
+        setIsRefreshing(true);
+        setPollCountdown(REFRESH_INTERVAL_SECONDS);
+      }
+
+      try {
+        const params = new URLSearchParams({ BusStopCode: stopCode });
+        if (serviceFilter && serviceFilter.trim() !== '') {
+          params.set('ServiceNo', serviceFilter.trim());
+        }
+
+        const res = await fetch(`/api/bus-arrival?${params.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (Array.isArray(data.Services) && data.Services.length > 0) {
+            setApiLiveConnected(true);
+            setStopsData((prevStops) => {
+              const existingStop = prevStops.find((s) => s.code === stopCode);
+              const mappedServices: BusServiceArrival[] = data.Services.map(
+                (rawSvc: LtaServiceRaw) => {
+                  const fallbackSvc = existingStop?.services.find(
+                    (s) => s.serviceNo === rawSvc.ServiceNo
+                  );
+                  const operator: OperatorType =
+                    rawSvc.Operator === 'SBST' ||
+                    rawSvc.Operator === 'SMRT' ||
+                    rawSvc.Operator === 'TTS' ||
+                    rawSvc.Operator === 'GAS'
+                      ? rawSvc.Operator
+                      : 'SBST';
+
+                  return {
+                    serviceNo: rawSvc.ServiceNo,
+                    operator,
+                    category:
+                      rawSvc.ServiceNo.endsWith('e') ||
+                      rawSvc.ServiceNo.endsWith('E')
+                        ? 'EXPRESS'
+                        : fallbackSvc?.category || 'TRUNK',
+                    originStopCode:
+                      rawSvc.NextBus?.OriginCode ||
+                      fallbackSvc?.originStopCode ||
+                      '52009',
+                    destinationName:
+                      fallbackSvc?.destinationName ||
+                      `Terminus #${rawSvc.NextBus?.DestinationCode || 'Int'}`,
+                    destinationStopCode:
+                      rawSvc.NextBus?.DestinationCode ||
+                      fallbackSvc?.destinationStopCode ||
+                      '17009',
+                    direction: 1,
+                    isFrequent: true,
+                    frequencyRange: fallbackSvc?.frequencyRange || '6–10 min',
+                    nextBuses: [
+                      parseLtaBusTiming(rawSvc.NextBus),
+                      parseLtaBusTiming(rawSvc.NextBus2),
+                      parseLtaBusTiming(rawSvc.NextBus3),
+                    ],
+                  };
+                }
+              );
+
+              // If user searched a custom 5-digit stop code not in initial list, add it dynamically
+              if (!existingStop) {
+                return [
+                  {
+                    code: stopCode,
+                    name: `LTA Bus Stop ${stopCode}`,
+                    roadName: 'Singapore Bus Network',
+                    district: 'Live LTA DataMall Stop',
+                    distanceMeters: 150,
+                    lat: mappedServices[0]?.nextBuses[0]?.lat || 1.2989,
+                    lng: mappedServices[0]?.nextBuses[0]?.lng || 103.8502,
+                    services: mappedServices,
+                  },
+                  ...prevStops,
+                ];
+              }
+
+              return prevStops.map((stop) =>
+                stop.code === stopCode
+                  ? { ...stop, services: mappedServices }
+                  : stop
+              );
+            });
+
+            if (manual) {
+              setTimeout(() => setIsRefreshing(false), 250);
+            }
+            return;
+          }
+        }
+      } catch {
+        // Fallback to local schedule progression if LTA_ACCOUNT_KEY is not yet set in env
+      }
+
+      setApiLiveConnected(false);
+      // Graceful schedule progression fallback until LTA_ACCOUNT_KEY is added in Vercel
+      setStopsData((prevStops) =>
+        prevStops.map((stop) => ({
+          ...stop,
+          services: stop.services.map((svc) => ({
+            ...svc,
+            nextBuses: svc.nextBuses.map((bus, idx) => {
+              if (idx === 0 && manual) {
+                const nextEta = bus.etaMinutes <= 0 ? 4 : bus.etaMinutes - 1;
+                return { ...bus, etaMinutes: nextEta };
+              }
+              return bus;
+            }) as typeof svc.nextBuses,
+          })),
+        }))
+      );
+
+      if (manual) {
+        setTimeout(() => setIsRefreshing(false), 250);
+      }
+    },
+    []
+  );
+
+  // Check /api/health on mount and fetch initial stop arrivals
+  useEffect(() => {
+    fetch('/api/health')
+      .then((r) => r.json())
+      .then((health) => {
+        if (health?.ltaDataMall?.accountKeyConfigured) {
+          setApiLiveConnected(true);
+        }
+      })
+      .catch(() => {});
+
+    fetchLtaBusArrivals(selectedStopCode, singleServiceQuery, false);
+  }, [selectedStopCode, singleServiceQuery, fetchLtaBusArrivals]);
+
+  // 20-second LTA DataMall polling timer
   useEffect(() => {
     const timer = setInterval(() => {
       setPollCountdown((prev) => {
         if (prev <= 1) {
-          triggerLiveRefresh(false);
-          return 30;
+          fetchLtaBusArrivals(selectedStopCode, singleServiceQuery, false);
+          return REFRESH_INTERVAL_SECONDS;
         }
         return prev - 1;
       });
     }, 1000);
     return () => clearInterval(timer);
-  }, []);
-
-  const triggerLiveRefresh = (manual = true) => {
-    if (manual) {
-      setIsRefreshing(true);
-      setPollCountdown(30);
-    }
-    // Simulate subtle real-time ETA progression
-    setStopsData((prevStops) =>
-      prevStops.map((stop) => ({
-        ...stop,
-        services: stop.services.map((svc) => ({
-          ...svc,
-          nextBuses: svc.nextBuses.map((bus, idx) => {
-            if (idx === 0) {
-              const nextEta = bus.etaMinutes <= 0 ? 4 : bus.etaMinutes - 1;
-              return { ...bus, etaMinutes: nextEta };
-            }
-            return bus;
-          }) as typeof svc.nextBuses,
-        })),
-      }))
-    );
-    if (manual) {
-      setTimeout(() => setIsRefreshing(false), 300);
-    }
-  };
+  }, [selectedStopCode, singleServiceQuery, fetchLtaBusArrivals]);
 
   const handleLocateNearestStop = () => {
     setGpsStatus('Locating nearest LTA bus stop...');
     setTimeout(() => {
-      setSelectedStopCode('01012');
-      setGpsStatus('Nearest stop locked: 01012 Hotel Grand Pacific (85m)');
+      setSelectedStopCode('04121');
+      setGpsStatus('Nearest stop locked: 04121 Bef Bencoolen Stn Exit A (60m)');
       setTimeout(() => setGpsStatus(null), 3500);
     }, 350);
+  };
+
+  // Allow querying any 5-digit LTA BusStopCode directly from the search bar
+  const handleSearchSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = searchQuery.trim();
+    if (/^\d{5}$/.test(trimmed)) {
+      setSelectedStopCode(trimmed);
+      fetchLtaBusArrivals(trimmed, singleServiceQuery, true);
+    }
   };
 
   const toggleBookmark = (stopCode: string, serviceNo: string) => {
@@ -133,7 +323,7 @@ export default function App() {
     [stopsData, selectedStopCode]
   );
 
-  // Filtered stops or services based on search input
+  // Filtered stops based on search input
   const matchingStops = useMemo(() => {
     if (!searchQuery.trim()) return stopsData;
     const q = searchQuery.toLowerCase().trim();
@@ -149,12 +339,23 @@ export default function App() {
   // Filtered services inside the active bus stop
   const filteredServices = useMemo(() => {
     return selectedStop.services.filter((svc) => {
+      if (
+        singleServiceQuery.trim() &&
+        svc.serviceNo.toLowerCase() !== singleServiceQuery.trim().toLowerCase()
+      ) {
+        return false;
+      }
+
       const matchesQuery =
         !searchQuery.trim() ||
         svc.serviceNo.toLowerCase().includes(searchQuery.toLowerCase().trim()) ||
-        svc.destinationName.toLowerCase().includes(searchQuery.toLowerCase().trim()) ||
+        svc.destinationName
+          .toLowerCase()
+          .includes(searchQuery.toLowerCase().trim()) ||
         selectedStop.code.includes(searchQuery.trim()) ||
-        selectedStop.name.toLowerCase().includes(searchQuery.toLowerCase().trim());
+        selectedStop.name
+          .toLowerCase()
+          .includes(searchQuery.toLowerCase().trim());
 
       if (!matchesQuery) return false;
       if (categoryFilter === 'TRUNK') return svc.category === 'TRUNK';
@@ -163,9 +364,9 @@ export default function App() {
         return svc.nextBuses[0].load === 'SEA';
       return true;
     });
-  }, [selectedStop, searchQuery, categoryFilter]);
+  }, [selectedStop, searchQuery, categoryFilter, singleServiceQuery]);
 
-  // Active Route Detail (fallback to 147 or 190 if another service is clicked)
+  // Active Route Detail
   const activeRouteDetail = useMemo(() => {
     if (ROUTE_SEQUENCES[selectedServiceNo]) {
       return ROUTE_SEQUENCES[selectedServiceNo];
@@ -173,11 +374,12 @@ export default function App() {
     return ROUTE_SEQUENCES['147'];
   }, [selectedServiceNo]);
 
-  // Circular SVG progress calculation for 30s LTA poll cycle
+  // Circular SVG progress calculation for 20s LTA poll cycle
   const circleRadius = 9;
   const circleCircumference = 2 * Math.PI * circleRadius;
   const strokeDashoffset =
-    circleCircumference - (pollCountdown / 30) * circleCircumference;
+    circleCircumference -
+    (pollCountdown / REFRESH_INTERVAL_SECONDS) * circleCircumference;
 
   return (
     <div className="min-h-screen bg-[#F8FAFC] text-[#181C26] flex flex-col pb-20 md:pb-10">
@@ -244,11 +446,17 @@ export default function App() {
             </button>
           </nav>
 
-          {/* Zone 3: 1-2 Primary Actions (30s LTA Poll Cycle + Refresh Button) */}
+          {/* Zone 3: Primary Action (20s LTA Poll Cycle + Refresh Button) */}
           <div className="flex items-center gap-2.5">
             <button
               type="button"
-              onClick={() => triggerLiveRefresh(true)}
+              onClick={() =>
+                fetchLtaBusArrivals(
+                  selectedStopCode,
+                  singleServiceQuery,
+                  true
+                )
+              }
               aria-label="Refresh LTA DataMall Bus Timings"
               className="h-10 px-3.5 rounded-lg bg-[#8B1D74] hover:bg-[#5A1657] text-white font-display text-xs font-semibold flex items-center gap-2 transition-colors cursor-pointer whitespace-nowrap"
             >
@@ -274,7 +482,7 @@ export default function App() {
                 />
               </svg>
               <span className="tabular-nums">
-                {isRefreshing ? 'Syncing...' : `Poll ${pollCountdown}s`}
+                {isRefreshing ? 'Syncing...' : `Refresh ${pollCountdown}s`}
               </span>
               <RefreshCw
                 className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`}
@@ -290,14 +498,17 @@ export default function App() {
         <section className="mb-6">
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-4 items-center">
             {/* 48px Height Search Input with Leading Search & Trailing GPS Action */}
-            <div className="lg:col-span-6 relative">
+            <form
+              onSubmit={handleSearchSubmit}
+              className="lg:col-span-6 relative"
+            >
               <div className="relative flex items-center h-12 w-full bg-white border border-[#E2E8F0] rounded-lg focus-within:ring-2 focus-within:ring-[#8B1D74] focus-within:border-[#8B1D74] transition-all">
                 <Search className="w-4 h-4 text-[#85727D] ml-3.5 shrink-0" />
                 <input
                   type="text"
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search 5-digit stop code (01012), road, or bus service (147, 190)..."
+                  placeholder="Enter BusStopCode (e.g. 04121, 01012) or ServiceNo (7, 147)..."
                   className="w-full h-full px-3 text-sm text-[#181C26] placeholder-[#85727D] bg-transparent focus:outline-none"
                 />
                 {searchQuery && (
@@ -327,9 +538,9 @@ export default function App() {
                   <span>{gpsStatus}</span>
                 </div>
               )}
-            </div>
+            </form>
 
-            {/* Interactive Bus Stop Switcher Pills */}
+            {/* Interactive Bus Stop Switcher Buttons */}
             <div className="lg:col-span-6 flex items-center gap-1.5 overflow-x-auto pb-1 lg:pb-0">
               {matchingStops.map((stop) => {
                 const isActive = stop.code === selectedStop.code;
@@ -339,6 +550,7 @@ export default function App() {
                     type="button"
                     onClick={() => {
                       setSelectedStopCode(stop.code);
+                      setSingleServiceQuery('');
                       if (stop.services.length > 0) {
                         setSelectedServiceNo(stop.services[0].serviceNo);
                       }
@@ -388,6 +600,12 @@ export default function App() {
                       <span className="tabular-nums">
                         {selectedStop.distanceMeters}m away
                       </span>
+                      <span aria-hidden="true">·</span>
+                      <span className="text-[#8B1D74] font-medium">
+                        {apiLiveConnected
+                          ? 'LTA DataMall v3 Live (20s)'
+                          : 'LTA v3 Ready (20s Cycle)'}
+                      </span>
                     </div>
                   </div>
 
@@ -408,30 +626,53 @@ export default function App() {
                   )}
                 </div>
 
-                {/* Filter Segmented Control + LTA Load Legend */}
+                {/* Filter Segmented Control + Optional ServiceNo Filter */}
                 <div className="mt-4 pt-3.5 border-t border-[#F1F5F9] flex flex-wrap items-center justify-between gap-3">
-                  <div className="flex items-center gap-1 p-1 bg-[#F1F5F9] rounded-lg">
-                    {(
-                      [
-                        { id: 'ALL', label: 'All Services' },
-                        { id: 'TRUNK', label: 'Trunk' },
-                        { id: 'EXPRESS', label: 'Express' },
-                        { id: 'SEATS_ONLY', label: 'Seats Avail' },
-                      ] as { id: CategoryFilter; label: string }[]
-                    ).map((tab) => (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        onClick={() => setCategoryFilter(tab.id)}
-                        className={`px-2.5 py-1.5 text-xs font-display font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
-                          categoryFilter === tab.id
-                            ? 'bg-white text-[#8B1D74] shadow-xs'
-                            : 'text-[#53424C] hover:text-[#181C26]'
-                        }`}
-                      >
-                        {tab.label}
-                      </button>
-                    ))}
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1 p-1 bg-[#F1F5F9] rounded-lg">
+                      {(
+                        [
+                          { id: 'ALL', label: 'All Services' },
+                          { id: 'TRUNK', label: 'Trunk' },
+                          { id: 'EXPRESS', label: 'Express' },
+                          { id: 'SEATS_ONLY', label: 'Seats Avail' },
+                        ] as { id: CategoryFilter; label: string }[]
+                      ).map((tab) => (
+                        <button
+                          key={tab.id}
+                          type="button"
+                          onClick={() => setCategoryFilter(tab.id)}
+                          className={`px-2.5 py-1.5 text-xs font-display font-semibold rounded-md transition-colors cursor-pointer whitespace-nowrap ${
+                            categoryFilter === tab.id
+                              ? 'bg-white text-[#8B1D74] shadow-xs'
+                              : 'text-[#53424C] hover:text-[#181C26]'
+                          }`}
+                        >
+                          {tab.label}
+                        </button>
+                      ))}
+                    </div>
+
+                    {/* Quick ServiceNo Query Filter (e.g. &ServiceNo=7) */}
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="text"
+                        value={singleServiceQuery}
+                        onChange={(e) => setSingleServiceQuery(e.target.value)}
+                        placeholder="ServiceNo (e.g. 7)"
+                        aria-label="Filter by specific ServiceNo"
+                        className="h-8 w-32 px-2.5 text-xs bg-white border border-[#E2E8F0] rounded-md text-[#181C26] placeholder-[#85727D] focus:outline-none focus:border-[#8B1D74]"
+                      />
+                      {singleServiceQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setSingleServiceQuery('')}
+                          className="h-8 px-2 text-xs text-[#53424C] hover:text-[#181C26] cursor-pointer"
+                        >
+                          Clear
+                        </button>
+                      )}
+                    </div>
                   </div>
 
                   {/* LTA Capacity Legend */}
@@ -452,7 +693,7 @@ export default function App() {
                 </div>
               </div>
 
-              {/* Bus Arrival Cards Stack (space-sm / 8px-12px vertical rhythm) */}
+              {/* Bus Arrival Cards Stack */}
               {filteredServices.length > 0 ? (
                 <div className="space-y-2.5">
                   {filteredServices.map((service) => (
@@ -474,15 +715,16 @@ export default function App() {
                 <div className="bg-white border border-[#E2E8F0] rounded-lg p-8 text-center">
                   <Bus className="w-8 h-8 text-[#85727D] mx-auto mb-2" />
                   <h3 className="font-display font-bold text-base text-[#181C26]">
-                    No matching bus services at this stop
+                    No matching bus services at Stop {selectedStop.code}
                   </h3>
                   <p className="text-sm text-[#53424C] mt-1">
-                    Reset the category filter or clear your search query to view all LTA arrivals.
+                    Reset the ServiceNo or category filter to view all LTA arrivals at this stop.
                   </p>
                   <button
                     type="button"
                     onClick={() => {
                       setCategoryFilter('ALL');
+                      setSingleServiceQuery('');
                       setSearchQuery('');
                     }}
                     className="mt-4 h-10 px-4 rounded-lg bg-[#8B1D74] text-white font-display text-xs font-semibold cursor-pointer"
@@ -769,7 +1011,7 @@ export default function App() {
         )}
       </main>
 
-      {/* Mobile Bottom Navigation Bar (Natural Thumb Zone, <= 15% Viewport Cap) */}
+      {/* Mobile Bottom Navigation Bar */}
       <nav
         aria-label="Mobile Transit Navigation"
         className="md:hidden fixed bottom-0 left-0 right-0 z-40 bg-white/95 backdrop-blur-md border-t border-[#E2E8F0] grid grid-cols-4 items-center h-16 px-2"
