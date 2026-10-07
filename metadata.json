@@ -1,0 +1,6 @@
+{
+  "name": "Transit Pulse Singapore",
+  "description": "High-reliability civic bus arrival tracker, route sequence monitor, and LTA DataMall capacity dashboard for Singapore commuters.",
+  "requestFramePermissions": ["geolocation"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
